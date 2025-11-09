@@ -1,4 +1,3 @@
-
 import 'dart:io';
 import 'dart:async';
 import 'dart:math';
@@ -36,6 +35,7 @@ class TunerScreen extends StatefulWidget {
 
 class _TunerScreenState extends State<TunerScreen> {
   double _frequency = 0.0;
+  double _lastFrequency = 0.0;
   String _note = '--';
   int _octave = 0;
   bool _isListening = false;
@@ -43,7 +43,8 @@ class _TunerScreenState extends State<TunerScreen> {
   final AudioRecorder _audioRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _audioSubscription;
   final List<double> _audioBuffer = [];
-  
+  final List<double> _recentFrequencies = [];
+
   final List<String> _noteNames = [
     'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'
   ];
@@ -55,10 +56,7 @@ class _TunerScreenState extends State<TunerScreen> {
   }
 
   Future<void> _checkPermissions() async {
-    if (await _audioRecorder.hasPermission()) {
-      // Дозвіл надано
-    } else {
-      // Для Android потрібен permission_handler
+    if (!await _audioRecorder.hasPermission()) {
       await Permission.microphone.request();
     }
   }
@@ -104,6 +102,7 @@ class _TunerScreenState extends State<TunerScreen> {
       _note = '--';
       _octave = 0;
       _audioBuffer.clear();
+      _recentFrequencies.clear();
     });
   }
 
@@ -121,8 +120,12 @@ class _TunerScreenState extends State<TunerScreen> {
 
     // Обробляємо, коли маємо достатньо даних
     if (_audioBuffer.length >= 4096) {
-      double detectedFreq = _detectFrequency(_audioBuffer, 44100);
-      
+      // Застосовуємо Hann-вікно для зменшення гармонік
+      List<double> windowed = _applyHannWindow(_audioBuffer);
+
+      double detectedFreq = _yinPitch(windowed, 44100);
+      detectedFreq = _postprocessFrequency(detectedFreq);
+
       if (detectedFreq > 0) {
         setState(() {
           _frequency = detectedFreq;
@@ -137,62 +140,70 @@ class _TunerScreenState extends State<TunerScreen> {
     }
   }
 
-  double _detectFrequency(List<double> samples, int sampleRate) {
-    if (samples.length < 2048) return 0.0;
+  // --- Покращений алгоритм визначення частоти (YIN) ---
+  double _yinPitch(List<double> samples, int sampleRate) {
+    int tauMax = samples.length ~/ 2;
+    List<double> diff = List.filled(tauMax, 0.0);
 
-    // Обчислюємо RMS для перевірки рівня сигналу
-    double rms = 0.0;
-    for (var sample in samples) {
-      rms += sample * sample;
-    }
-    rms = sqrt(rms / samples.length);
-
-    // Ігноруємо тихі сигнали
-    if (rms < 0.01) return 0.0;
-
-    // Автокореляція для визначення періоду
-    int minPeriod = (sampleRate / 1000).round(); // ~1000 Hz max
-    int maxPeriod = (sampleRate / 60).round();   // ~60 Hz min
-
-    double bestCorrelation = 0.0;
-    int bestPeriod = 0;
-
-    // Нормалізуємо семпли
-    double sum = 0.0;
-    for (var sample in samples) {
-      sum += sample;
-    }
-    double mean = sum / samples.length;
-
-    List<double> normalized = samples.map((s) => s - mean).toList();
-
-    for (int period = minPeriod; period < maxPeriod && period < samples.length ~/ 2; period++) {
-      double correlation = 0.0;
-      double norm1 = 0.0;
-      double norm2 = 0.0;
-
-      for (int i = 0; i < samples.length - period; i++) {
-        correlation += normalized[i] * normalized[i + period];
-        norm1 += normalized[i] * normalized[i];
-        norm2 += normalized[i + period] * normalized[i + period];
+    for (int tau = 1; tau < tauMax; tau++) {
+      double sum = 0;
+      for (int i = 0; i < tauMax; i++) {
+        double delta = samples[i] - samples[i + tau];
+        sum += delta * delta;
       }
+      diff[tau] = sum;
+    }
 
-      if (norm1 > 0 && norm2 > 0) {
-        correlation = correlation / sqrt(norm1 * norm2);
-      }
+    List<double> cmnd = List.filled(tauMax, 0.0);
+    cmnd[0] = 1;
+    double runningSum = 0;
+    for (int tau = 1; tau < tauMax; tau++) {
+      runningSum += diff[tau];
+      cmnd[tau] = diff[tau] * tau / runningSum;
+    }
 
-      if (correlation > bestCorrelation) {
-        bestCorrelation = correlation;
-        bestPeriod = period;
+    const threshold = 0.1;
+    for (int tau = 2; tau < tauMax; tau++) {
+      if (cmnd[tau] < threshold) {
+        int tau0 = tau - 1;
+        int tau2 = tau + 1;
+        if (tau2 >= cmnd.length) break;
+        double betterTau = tau +
+            (cmnd[tau2] - cmnd[tau0]) /
+                (2 * (2 * cmnd[tau] - cmnd[tau2] - cmnd[tau0]));
+        return sampleRate / betterTau;
       }
     }
-
-    // Потрібна висока кореляція для надійного визначення
-    if (bestPeriod > 0 && bestCorrelation > 0.5) {
-      return sampleRate / bestPeriod;
-    }
-
     return 0.0;
+  }
+
+  List<double> _applyHannWindow(List<double> samples) {
+    final length = samples.length;
+    return List.generate(length, (i) {
+      double w = 0.5 * (1 - cos(2 * pi * i / (length - 1)));
+      return samples[i] * w;
+    });
+  }
+
+  double _postprocessFrequency(double freq) {
+    if (freq <= 0) return 0.0;
+
+    // 1️⃣ медіанне згладжування
+    _recentFrequencies.add(freq);
+    if (_recentFrequencies.length > 5) {
+      _recentFrequencies.removeAt(0);
+    }
+    List<double> sorted = List.from(_recentFrequencies)..sort();
+    freq = sorted[sorted.length ~/ 2];
+
+    // 2️⃣ корекція октав (якщо фаза подвоєна або половинна)
+    if (_lastFrequency > 0) {
+      if ((freq * 2 - _lastFrequency).abs() < 5) freq *= 2;
+      if ((freq / 2 - _lastFrequency).abs() < 5) freq /= 2;
+    }
+
+    _lastFrequency = freq;
+    return freq;
   }
 
   void _updateNote(double frequency) {
@@ -228,7 +239,6 @@ class _TunerScreenState extends State<TunerScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Частота
               Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 32,
@@ -248,8 +258,6 @@ class _TunerScreenState extends State<TunerScreen> {
                 ),
               ),
               const SizedBox(height: 60),
-              
-              // Нота
               Text(
                 _note,
                 style: TextStyle(
@@ -260,8 +268,6 @@ class _TunerScreenState extends State<TunerScreen> {
                 ),
               ),
               const SizedBox(height: 20),
-              
-              // Октава
               Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 24,
@@ -280,8 +286,6 @@ class _TunerScreenState extends State<TunerScreen> {
                 ),
               ),
               const SizedBox(height: 80),
-              
-              // Кнопка
               ElevatedButton.icon(
                 onPressed: _isListening ? _stopListening : _startListening,
                 icon: Icon(_isListening ? Icons.stop : Icons.mic),
