@@ -1,10 +1,10 @@
-import 'dart:io';
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
+import 'note_scroll_bar.dart';
 
 void main() {
   runApp(const TinyTunerApp());
@@ -36,18 +36,12 @@ class TunerScreen extends StatefulWidget {
 class _TunerScreenState extends State<TunerScreen> {
   double _frequency = 0.0;
   double _lastFrequency = 0.0;
-  String _note = '--';
-  int _octave = 0;
   bool _isListening = false;
   
   final AudioRecorder _audioRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _audioSubscription;
   final List<double> _audioBuffer = [];
   final List<double> _recentFrequencies = [];
-
-  final List<String> _noteNames = [
-    'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'
-  ];
 
   @override
   void initState() {
@@ -79,14 +73,14 @@ class _TunerScreenState extends State<TunerScreen> {
         _audioSubscription = stream.listen((data) {
           _processAudio(data);
         }, onError: (error) {
-          debugPrint('Помилка потоку аудіо: $error');
+          debugPrint('Audio stream error: $error');
           _stopListening();
         });
       } else {
-        debugPrint('Немає дозволу на використання мікрофона');
+        debugPrint('Permission denied for microphone access.');
       }
     } catch (e) {
-      debugPrint('Помилка запуску мікрофона: $e');
+      debugPrint('Microphone initialization error: $e');
       setState(() {
         _isListening = false;
       });
@@ -99,15 +93,13 @@ class _TunerScreenState extends State<TunerScreen> {
     setState(() {
       _isListening = false;
       _frequency = 0.0;
-      _note = '--';
-      _octave = 0;
       _audioBuffer.clear();
       _recentFrequencies.clear();
     });
   }
 
   void _processAudio(Uint8List bytes) {
-    // Конвертуємо байти в 16-бітні PCM семпли
+    // Convert bytes to 16-bits PCM samples
     List<double> samples = [];
     for (int i = 0; i < bytes.length - 1; i += 2) {
       int sample = bytes[i] | (bytes[i + 1] << 8);
@@ -115,12 +107,11 @@ class _TunerScreenState extends State<TunerScreen> {
       samples.add(sample / 32768.0);
     }
 
-    // Додаємо до буфера
     _audioBuffer.addAll(samples);
 
-    // Обробляємо, коли маємо достатньо даних
+    // Handle buffer when enough samples are collected
     if (_audioBuffer.length >= 4096) {
-      // Застосовуємо Hann-вікно для зменшення гармонік
+      // Apply Hann window to reduce harmonics
       List<double> windowed = _applyHannWindow(_audioBuffer);
 
       double detectedFreq = _yinPitch(windowed, 44100);
@@ -129,18 +120,17 @@ class _TunerScreenState extends State<TunerScreen> {
       if (detectedFreq > 0) {
         setState(() {
           _frequency = detectedFreq;
-          _updateNote(detectedFreq);
         });
       }
 
-      // Очищуємо буфер, залишаючи трохи для перекриття
+      // Cleanup buffer keeping last 2048 samples for overlap
       if (_audioBuffer.length > 8192) {
         _audioBuffer.removeRange(0, _audioBuffer.length - 2048);
       }
     }
   }
 
-  // --- Покращений алгоритм визначення частоти (YIN) ---
+  // --- Improved frequency detection algorithm (YIN) ---
   double _yinPitch(List<double> samples, int sampleRate) {
     int tauMax = samples.length ~/ 2;
     List<double> diff = List.filled(tauMax, 0.0);
@@ -188,7 +178,7 @@ class _TunerScreenState extends State<TunerScreen> {
   double _postprocessFrequency(double freq) {
     if (freq <= 0) return 0.0;
 
-    // 1️⃣ медіанне згладжування
+    // Median smoothing over recent frequencies
     _recentFrequencies.add(freq);
     if (_recentFrequencies.length > 5) {
       _recentFrequencies.removeAt(0);
@@ -196,26 +186,15 @@ class _TunerScreenState extends State<TunerScreen> {
     List<double> sorted = List.from(_recentFrequencies)..sort();
     freq = sorted[sorted.length ~/ 2];
 
-    // 2️⃣ корекція октав (якщо фаза подвоєна або половинна)
+    // Octave correction (if the phase is doubled or halved)
     if (_lastFrequency > 0) {
       if ((freq * 2 - _lastFrequency).abs() < 5) freq *= 2;
       if ((freq / 2 - _lastFrequency).abs() < 5) freq /= 2;
     }
 
     _lastFrequency = freq;
+  
     return freq;
-  }
-
-  void _updateNote(double frequency) {
-    if (frequency < 20 || frequency > 4200) return;
-
-    // Формула: n = 12 * log2(f/440) + 69 (де 69 - це A4)
-    double n = 12 * log(frequency / 440) / log(2) + 69;
-    int midiNote = n.round();
-
-    _octave = (midiNote ~/ 12) - 1;
-    int noteIndex = midiNote % 12;
-    _note = _noteNames[noteIndex];
   }
 
   @override
@@ -235,68 +214,23 @@ class _TunerScreenState extends State<TunerScreen> {
       ),
       body: Center(
         child: Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 32,
-                  vertical: 16,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.grey[200],
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Text(
-                  '${_frequency.toStringAsFixed(1)} Hz',
-                  style: const TextStyle(
-                    fontSize: 48,
-                    fontWeight: FontWeight.bold,
-                    fontFamily: 'monospace',
-                  ),
-                ),
-              ),
-              const SizedBox(height: 60),
-              Text(
-                _note,
-                style: TextStyle(
-                  fontSize: 140,
-                  fontWeight: FontWeight.bold,
-                  color: _isListening ? Colors.blue : Colors.grey,
-                  height: 1.0,
-                ),
-              ),
-              const SizedBox(height: 20),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 24,
-                  vertical: 12,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.blue[50],
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  'Октава: $_octave',
-                  style: const TextStyle(
-                    fontSize: 36,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 80),
+              NoteScrollBar(frequency: _frequency),
+              const SizedBox(height: 40),
               ElevatedButton.icon(
                 onPressed: _isListening ? _stopListening : _startListening,
                 icon: Icon(_isListening ? Icons.stop : Icons.mic),
                 label: Text(
-                  _isListening ? 'Зупинити' : 'Почати',
+                  _isListening ? 'Stop' : 'Start',
                   style: const TextStyle(fontSize: 20),
                 ),
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 48,
-                    vertical: 20,
+                    horizontal: 40,
+                    vertical: 16,
                   ),
                   backgroundColor: _isListening ? Colors.red : Colors.blue,
                   foregroundColor: Colors.white,
