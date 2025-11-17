@@ -1,10 +1,15 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'note_scroll_bar.dart';
+import 'about_page.dart';
+
+const SAMPLE_RATE = 16000;
 
 void main() {
   runApp(const TinyTunerApp());
@@ -32,7 +37,6 @@ class TunerScreen extends StatefulWidget {
   @override
   State<TunerScreen> createState() => _TunerScreenState();
 }
-
 class _TunerScreenState extends State<TunerScreen> {
   double _frequency = 0.0;
   double _lastFrequency = 0.0;
@@ -56,12 +60,15 @@ class _TunerScreenState extends State<TunerScreen> {
   }
 
   Future<void> _startListening() async {
+    if (Platform.isAndroid || Platform.isIOS) {
+      await WakelockPlus.enable();
+    }
     try {
       if (await _audioRecorder.hasPermission()) {
         final stream = await _audioRecorder.startStream(
           const RecordConfig(
             encoder: AudioEncoder.pcm16bits,
-            sampleRate: 44100,
+            sampleRate: SAMPLE_RATE,
             numChannels: 1,
           ),
         );
@@ -90,6 +97,9 @@ class _TunerScreenState extends State<TunerScreen> {
   Future<void> _stopListening() async {
     await _audioSubscription?.cancel();
     await _audioRecorder.stop();
+    if (Platform.isAndroid || Platform.isIOS) {
+      await WakelockPlus.disable();
+    }
     setState(() {
       _isListening = false;
       _frequency = 0.0;
@@ -114,7 +124,7 @@ class _TunerScreenState extends State<TunerScreen> {
       // Apply Hann window to reduce harmonics
       List<double> windowed = _applyHannWindow(_audioBuffer);
 
-      double detectedFreq = _yinPitch(windowed, 44100);
+      double detectedFreq = _yinPitch(windowed, SAMPLE_RATE);
       detectedFreq = _postprocessFrequency(detectedFreq);
 
       if (detectedFreq > 0) {
@@ -199,6 +209,9 @@ class _TunerScreenState extends State<TunerScreen> {
 
   @override
   void dispose() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      WakelockPlus.disable();
+    }
     _stopListening();
     _audioRecorder.dispose();
     super.dispose();
@@ -209,6 +222,19 @@ class _TunerScreenState extends State<TunerScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Tiny Tuner'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => AboutPage(),
+                ),
+              );
+            },
+          ),
+        ],
         centerTitle: true,
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
       ),
